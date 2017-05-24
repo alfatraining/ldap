@@ -106,6 +106,10 @@ var _ Client = &Conn{}
 // multiple places will probably result in undesired behaviour.
 var DefaultTimeout = 60 * time.Second
 
+// QueueMessageTimeout denotes the amount of time after which a failure to queue
+// a message in chanMessage results in the discarding of said message.
+var QueueMessageTimeout = time.Second
+
 // Dial connects to the given address on the given network using net.Dial
 // and then returns a new Conn for the connection.
 func Dial(network, addr string) (*Conn, error) {
@@ -329,6 +333,8 @@ func (l *Conn) sendProcessMessage(message *messagePacket) bool {
 		return false
 	case l.chanMessage <- message:
 		return true
+	case <-time.After(QueueMessageTimeout):
+		return false
 	}
 }
 
