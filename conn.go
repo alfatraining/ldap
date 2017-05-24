@@ -18,8 +18,6 @@ import (
 )
 
 const (
-	// MessageQuit causes the processMessages loop to exit
-	MessageQuit = 0
 	// MessageRequest sends a request to the server
 	MessageRequest = 1
 	// MessageResponse receives a response from the server
@@ -81,22 +79,23 @@ const (
 
 // Conn represents an LDAP Connection
 type Conn struct {
-	conn                net.Conn
-	isTLS               bool
 	closeCount          uint32
 	closeErr            atomicValue
-	isStartingTLS       bool
+	conn                net.Conn
+	isTLS               bool
+	requestTimeout      time.Duration
 	Debug               debugging
-	chanConfirm         chan bool
+	chanConfirm         chan struct{}
 	messageContexts     map[int64]*messageContext
 	chanMessage         chan *messagePacket
 	chanMessageID       chan int64
-	wgSender            sync.WaitGroup
+	chanShutdown        chan struct{}
 	wgClose             sync.WaitGroup
 	once                sync.Once
+
+	messageMutex        sync.Mutex // mutex hat
+	isStartingTLS       bool
 	outstandingRequests uint
-	messageMutex        sync.Mutex
-	requestTimeout      time.Duration
 }
 
 var _ Client = &Conn{}
@@ -107,6 +106,10 @@ var _ Client = &Conn{}
 // WARNING: since this is a package-level variable, setting this value from
 // multiple places will probably result in undesired behaviour.
 var DefaultTimeout = 60 * time.Second
+
+// QueueMessageTimeout denotes the amount of time after which a failure to queue
+// a message in chanMessage results in the discarding of said message.
+var QueueMessageTimeout = time.Second
 
 // Dial connects to the given address on the given network using net.Dial
 // and then returns a new Conn for the connection.
@@ -143,9 +146,10 @@ func DialTLS(network, addr string, config *tls.Config) (*Conn, error) {
 func NewConn(conn net.Conn, isTLS bool) *Conn {
 	return &Conn{
 		conn:            conn,
-		chanConfirm:     make(chan bool),
+		chanConfirm:     make(chan struct{}),
 		chanMessageID:   make(chan int64),
 		chanMessage:     make(chan *messagePacket, 10),
+		chanShutdown:    make(chan struct{}),
 		messageContexts: map[int64]*messageContext{},
 		requestTimeout:  0,
 		isTLS:           isTLS,
@@ -173,12 +177,10 @@ func (l *Conn) setClosing() {
 func (l *Conn) Close() {
 	l.once.Do(func() {
 		l.setClosing()
-		l.wgSender.Wait()
 
 		l.Debug.Printf("Sending quit message and waiting for confirmation")
-		l.chanMessage <- &messagePacket{Op: MessageQuit}
+		close(l.chanShutdown)
 		<-l.chanConfirm
-		close(l.chanMessage)
 
 		l.Debug.Printf("Closing network connection")
 		if err := l.conn.Close(); err != nil {
@@ -327,13 +329,14 @@ func (l *Conn) finishMessage(msgCtx *messageContext) {
 }
 
 func (l *Conn) sendProcessMessage(message *messagePacket) bool {
-	if l.isClosing() {
+	select {
+	case <-l.chanShutdown:
+		return false
+	case l.chanMessage <- message:
+		return true
+	case <-time.After(QueueMessageTimeout):
 		return false
 	}
-	l.wgSender.Add(1)
-	l.chanMessage <- message
-	l.wgSender.Done()
-	return true
 }
 
 func (l *Conn) processMessages() {
@@ -352,24 +355,19 @@ func (l *Conn) processMessages() {
 			delete(l.messageContexts, messageID)
 		}
 		close(l.chanMessageID)
-		l.chanConfirm <- true
 		close(l.chanConfirm)
 	}()
 
 	var messageID int64 = 1
 	for {
 		select {
+		case <-l.chanShutdown:
+			l.Debug.Printf("Shutting down - shutdown channel closed")
+			return
 		case l.chanMessageID <- messageID:
 			messageID++
-		case message, ok := <-l.chanMessage:
-			if !ok {
-				l.Debug.Printf("Shutting down - message channel is closed")
-				return
-			}
+		case message := <-l.chanMessage:
 			switch message.Op {
-			case MessageQuit:
-				l.Debug.Printf("Shutting down - quit message received")
-				return
 			case MessageRequest:
 				// Add to message list and write to network
 				l.Debug.Printf("Sending message %d", message.MessageID)
@@ -380,7 +378,7 @@ func (l *Conn) processMessages() {
 					l.Debug.Printf("Error Sending Message: %s", err.Error())
 					message.Context.sendResponse(&PacketResponse{Error: fmt.Errorf("unable to send request: %s", err)})
 					close(message.Context.responses)
-					break
+					return
 				}
 
 				// Only add to messageContexts if we were able to
