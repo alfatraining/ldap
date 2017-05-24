@@ -91,7 +91,6 @@ type Conn struct {
 	messageContexts     map[int64]*messageContext
 	chanMessage         chan *messagePacket
 	chanMessageID       chan int64
-	wgSender            sync.WaitGroup
 	wgClose             sync.WaitGroup
 	once                sync.Once
 	outstandingRequests uint
@@ -173,12 +172,10 @@ func (l *Conn) setClosing() {
 func (l *Conn) Close() {
 	l.once.Do(func() {
 		l.setClosing()
-		l.wgSender.Wait()
 
 		l.Debug.Printf("Sending quit message and waiting for confirmation")
 		l.chanMessage <- &messagePacket{Op: MessageQuit}
 		<-l.chanConfirm
-		close(l.chanMessage)
 
 		l.Debug.Printf("Closing network connection")
 		if err := l.conn.Close(); err != nil {
@@ -327,13 +324,10 @@ func (l *Conn) finishMessage(msgCtx *messageContext) {
 }
 
 func (l *Conn) sendProcessMessage(message *messagePacket) bool {
-	if l.isClosing() {
-		return false
+	select {
+	case l.chanMessage <- message:
+		return true
 	}
-	l.wgSender.Add(1)
-	l.chanMessage <- message
-	l.wgSender.Done()
-	return true
 }
 
 func (l *Conn) processMessages() {
@@ -361,11 +355,7 @@ func (l *Conn) processMessages() {
 		select {
 		case l.chanMessageID <- messageID:
 			messageID++
-		case message, ok := <-l.chanMessage:
-			if !ok {
-				l.Debug.Printf("Shutting down - message channel is closed")
-				return
-			}
+		case message := <-l.chanMessage:
 			switch message.Op {
 			case MessageQuit:
 				l.Debug.Printf("Shutting down - quit message received")
