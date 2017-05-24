@@ -79,10 +79,10 @@ const (
 
 // Conn represents an LDAP Connection
 type Conn struct {
-	conn                net.Conn
-	isTLS               bool
 	closeCount          uint32
 	closeErr            atomicValue
+	conn                net.Conn
+	isTLS               bool
 	requestTimeout      time.Duration
 	Debug               debugging
 	chanConfirm         chan struct{}
