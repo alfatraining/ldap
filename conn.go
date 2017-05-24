@@ -18,8 +18,6 @@ import (
 )
 
 const (
-	// MessageQuit causes the processMessages loop to exit
-	MessageQuit = 0
 	// MessageRequest sends a request to the server
 	MessageRequest = 1
 	// MessageResponse receives a response from the server
@@ -91,6 +89,7 @@ type Conn struct {
 	messageContexts     map[int64]*messageContext
 	chanMessage         chan *messagePacket
 	chanMessageID       chan int64
+	chanShutdown        chan struct{}
 	wgClose             sync.WaitGroup
 	once                sync.Once
 	outstandingRequests uint
@@ -145,6 +144,7 @@ func NewConn(conn net.Conn, isTLS bool) *Conn {
 		chanConfirm:     make(chan bool),
 		chanMessageID:   make(chan int64),
 		chanMessage:     make(chan *messagePacket, 10),
+		chanShutdown:    make(chan struct{}),
 		messageContexts: map[int64]*messageContext{},
 		requestTimeout:  0,
 		isTLS:           isTLS,
@@ -174,7 +174,7 @@ func (l *Conn) Close() {
 		l.setClosing()
 
 		l.Debug.Printf("Sending quit message and waiting for confirmation")
-		l.chanMessage <- &messagePacket{Op: MessageQuit}
+		close(l.chanShutdown)
 		<-l.chanConfirm
 
 		l.Debug.Printf("Closing network connection")
@@ -325,6 +325,8 @@ func (l *Conn) finishMessage(msgCtx *messageContext) {
 
 func (l *Conn) sendProcessMessage(message *messagePacket) bool {
 	select {
+	case <-l.chanShutdown:
+		return false
 	case l.chanMessage <- message:
 		return true
 	}
@@ -353,13 +355,13 @@ func (l *Conn) processMessages() {
 	var messageID int64 = 1
 	for {
 		select {
+		case <-l.chanShutdown:
+			l.Debug.Printf("Shutting down - shutdown channel closed")
+			return
 		case l.chanMessageID <- messageID:
 			messageID++
 		case message := <-l.chanMessage:
 			switch message.Op {
-			case MessageQuit:
-				l.Debug.Printf("Shutting down - quit message received")
-				return
 			case MessageRequest:
 				// Add to message list and write to network
 				l.Debug.Printf("Sending message %d", message.MessageID)
@@ -370,7 +372,7 @@ func (l *Conn) processMessages() {
 					l.Debug.Printf("Error Sending Message: %s", err.Error())
 					message.Context.sendResponse(&PacketResponse{Error: fmt.Errorf("unable to send request: %s", err)})
 					close(message.Context.responses)
-					break
+					return
 				}
 
 				// Only add to messageContexts if we were able to
