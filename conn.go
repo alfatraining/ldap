@@ -83,7 +83,7 @@ type Conn struct {
 	isTLS               bool
 	closeCount          uint32
 	closeErr            atomicValue
-	isStartingTLS       bool
+	requestTimeout      time.Duration
 	Debug               debugging
 	chanConfirm         chan struct{}
 	messageContexts     map[int64]*messageContext
@@ -92,9 +92,10 @@ type Conn struct {
 	chanShutdown        chan struct{}
 	wgClose             sync.WaitGroup
 	once                sync.Once
+
+	messageMutex        sync.Mutex // mutex hat
+	isStartingTLS       bool
 	outstandingRequests uint
-	messageMutex        sync.Mutex
-	requestTimeout      time.Duration
 }
 
 var _ Client = &Conn{}
